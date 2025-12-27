@@ -1,3 +1,5 @@
+Not used. Forked actual script used for GOS root OTA just in case.
+===
 rooted-graphene
 ===
 
