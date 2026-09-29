@@ -28,6 +28,14 @@ GITHUB_REPO=${GITHUB_REPO:-''}
 MAGISK_PREINIT_DEVICE=${MAGISK_PREINIT_DEVICE:-}
 # Skip creation of rootless OTA by setting to "true"
 SKIP_ROOTLESS=${SKIP_ROOTLESS:-'false'}
+# Skip creation of magisk OTA by setting to "true".
+SKIP_MAGISK=${SKIP_MAGISK:-'false'}
+# In addition to upstream magisk, an OTA can be patched with pixincreate's magisk fork,
+# which contains patches that make zygisk work on GrapheneOS.
+# https://github.com/pixincreate/Magisk
+# Note that modules verifying magisk's signature won't work with this fork.
+# Enable by setting to "false".
+SKIP_PIXINCREATE=${SKIP_PIXINCREATE:-'true'}
 # https://grapheneos.org/releases#stable-channel
 OTA_VERSION=${OTA_VERSION:-'latest'}
 
@@ -67,17 +75,17 @@ NO_COLOR=${NO_COLOR:-''}
 OTA_BASE_URL="https://releases.grapheneos.org"
 
 # renovate: datasource=github-releases packageName=chenxiaolong/avbroot versioning=semver
-AVB_ROOT_VERSION=3.30.2
+AVB_ROOT_VERSION=3.34.1
 # renovate: datasource=github-releases packageName=chenxiaolong/Custota versioning=semver-coerced
-CUSTOTA_VERSION=5.23
+CUSTOTA_VERSION=6.6
 # renovate: datasource=git-refs packageName=https://github.com/chenxiaolong/my-avbroot-setup currentValue=master
-PATCH_PY_COMMIT=84139189c8cbe244a676582a3b3517f31fabc421
+PATCH_PY_COMMIT=9161b3e13416790d7e6da21d9dac5a14bc724504
 # renovate: datasource=docker packageName=python
-PYTHON_VERSION=3.14.6-alpine
+PYTHON_VERSION=3.14.7-alpine
 # renovate: datasource=github-releases packageName=chenxiaolong/OEMUnlockOnBoot versioning=semver-coerced
-OEMUNLOCKONBOOT_VERSION=1.3
+OEMUNLOCKONBOOT_VERSION=1.4
 # renovate: datasource=github-releases packageName=chenxiaolong/afsr versioning=semver
-AFSR_VERSION=1.0.4
+AFSR_VERSION=2.0.0
 
 CHENXIAOLONG_PK='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDOe6/tBnO7xZhAWXRj3ApUYgn+XZ0wnQiXM8B7tPgv4'
 GIT_PUSH_RETRIES=10
@@ -141,9 +149,20 @@ function checkBuildNecessary() {
   currentCommit=$(git rev-parse --short HEAD)
   POTENTIAL_ASSETS=()
     
-  if [[ -n "$MAGISK_PREINIT_DEVICE" ]]; then 
-    # e.g. oriole-2023121200-magisk-v26.4-4647f74-dirty.zip
-    POTENTIAL_ASSETS['magisk']="${DEVICE_ID}-${OTA_VERSION}-${currentCommit}-magisk-${MAGISK_VERSION}$(createAssetSuffix).zip"
+  if [[ -n "$MAGISK_PREINIT_DEVICE" ]]; then
+    if [[ "$SKIP_MAGISK" != 'true' ]]; then
+      # e.g. oriole-2023121200-magisk-v26.4-4647f74-dirty.zip
+      POTENTIAL_ASSETS['magisk']="${DEVICE_ID}-${OTA_VERSION}-${currentCommit}-magisk-${MAGISK_VERSION}$(createAssetSuffix).zip"
+    else
+      printGreen "SKIP_MAGISK set, not creating upstream magisk OTA"
+    fi
+
+    if [[ "$SKIP_PIXINCREATE" != 'true' ]]; then
+      # e.g. oriole-2023121200-pixincreate-v30.7-4647f74-dirty.zip
+      POTENTIAL_ASSETS['pixincreate']="${DEVICE_ID}-${OTA_VERSION}-${currentCommit}-pixincreate-${MAGISK_VERSION}$(createAssetSuffix).zip"
+    else
+      printGreen "SKIP_PIXINCREATE set, not creating pixincreate OTA"
+    fi
   else 
     printGreen "MAGISK_PREINIT_DEVICE not set for device, not creating magisk OTA"
   fi
@@ -238,6 +257,11 @@ function downloadAndroidDependencies() {
     curl --fail -sLo ".tmp/magisk-$MAGISK_VERSION.apk" "https://github.com/topjohnwu/Magisk/releases/download/$MAGISK_VERSION/Magisk-$MAGISK_VERSION.apk"
   fi
 
+  # pixincreate's fork releases its APK as "app-release.apk" and uses the same tags as upstream magisk
+  if ! ls ".tmp/pixincreate-$MAGISK_VERSION.apk" >/dev/null 2>&1 && [[ "${POTENTIAL_ASSETS['pixincreate']+isset}" ]]; then
+    curl --fail -sLo ".tmp/pixincreate-$MAGISK_VERSION.apk" "https://github.com/pixincreate/Magisk/releases/download/$MAGISK_VERSION/app-release.apk"
+  fi
+
   if ! ls ".tmp/$OTA_TARGET.zip" >/dev/null 2>&1; then
     curl --fail -sLo ".tmp/$OTA_TARGET.zip" "$OTA_URL"
   fi
@@ -329,6 +353,10 @@ function patchOTAs() {
         args+=("--patch-arg=--magisk" "--patch-arg" ".tmp/magisk-$MAGISK_VERSION.apk")
         args+=("--patch-arg=--magisk-preinit-device" "--patch-arg" "$MAGISK_PREINIT_DEVICE")
       fi
+      if [[ "$flavor" == 'pixincreate' ]]; then
+        args+=("--patch-arg=--magisk" "--patch-arg" ".tmp/pixincreate-$MAGISK_VERSION.apk")
+        args+=("--patch-arg=--magisk-preinit-device" "--patch-arg" "$MAGISK_PREINIT_DEVICE")
+      fi
 
       # If env vars not set, passphrases will be queried interactively
       if [ -v PASSPHRASE_AVB ]; then
@@ -350,16 +378,19 @@ function patchOTAs() {
       # Python image is designed to run as root, so chown the files it creates back at the end
       # ... room for improvement 😐️
       # shellcheck disable=SC2046
-      docker run --rm -i $(tty &>/dev/null && echo '-t') -v "$PWD:/app"  -w /app \
-        -e PATH='/bin:/usr/local/bin:/sbin:/usr/bin/:/app/.tmp' \
-        --env-file <(env) \
-        python:${PYTHON_VERSION} sh -c \
-          "apk add openssh && \
-           pip install -r .tmp/my-avbroot-setup/requirements.txt && \
-           python .tmp/my-avbroot-setup/patch.py ${args[*]} ; result=\$?; \
-           chown -R $(id -u):$(id -g) .tmp; exit \$result"
-    
-       printGreen "Finished patching file ${targetFile}"
+      docker run --rm -i $(tty &>/dev/null && echo '-t') \
+    -v "$PWD:/app" \
+    -w /app \
+    -e PATH='/bin:/usr/local/bin:/sbin:/usr/bin:/app/.tmp' \
+    --env-file <(env) \
+    python:${PYTHON_VERSION} sh -c "set -e && \
+        apk add --no-cache openssh uv && \
+        uv sync --locked --project .tmp/my-avbroot-setup && \
+        uv run --project .tmp/my-avbroot-setup \
+            .tmp/my-avbroot-setup/patch.py ${args[*]} && \
+        chown -R $(id -u):$(id -g) .tmp"
+
+      printGreen "Finished patching file ${targetFile}"
     fi
     
   done
